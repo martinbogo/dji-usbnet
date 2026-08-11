@@ -43,14 +43,20 @@ static bool mac_is_zero(const uint8_t m[ETHER_ADDR_LEN]) {
     return true;
 }
 
+/* Locally administered (0x02 low bit set), unicast synthetic host-side MAC.
+ * One definition, shared by the bridge (ARP) and the DHCP client (chaddr). */
+static const uint8_t g_host_mac[ETHER_ADDR_LEN] = {0x02, 0x1a, 0x00, 0x00, 0x00, 0x01};
+
+void bridge_host_mac(uint8_t mac[ETHER_ADDR_LEN]) {
+    memcpy(mac, g_host_mac, ETHER_ADDR_LEN);
+}
+
 void bridge_init(bridge_ctx *b, const uint8_t drone_mac[ETHER_ADDR_LEN],
                  const char *host_ip, const char *drone_ip) {
     memset(b, 0, sizeof(*b));
     memcpy(b->drone_mac, drone_mac, ETHER_ADDR_LEN);
     b->mac_known = !mac_is_zero(drone_mac);
-    /* Locally administered (0x02 low bit set), unicast synthetic host MAC. */
-    static const uint8_t host_mac[ETHER_ADDR_LEN] = {0x02, 0x1a, 0x00, 0x00, 0x00, 0x01};
-    memcpy(b->host_mac, host_mac, ETHER_ADDR_LEN);
+    memcpy(b->host_mac, g_host_mac, ETHER_ADDR_LEN);
     b->host_ip_be  = inet_addr(host_ip);
     b->drone_ip_be = inet_addr(drone_ip);
 }

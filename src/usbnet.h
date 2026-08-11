@@ -86,6 +86,28 @@ typedef struct {
 void bridge_init(bridge_ctx *b, const uint8_t drone_mac[ETHER_ADDR_LEN],
                  const char *host_ip, const char *drone_ip);
 
+/* The synthetic, locally administered host-side MAC the bridge presents. Shared
+ * with the DHCP client so its chaddr matches the ARP identity. */
+void bridge_host_mac(uint8_t mac[ETHER_ADDR_LEN]);
+
+/* --------------------------------------------------------------------- DHCP */
+
+/* A lease obtained from the drone's DHCP server (if it runs one). Strings are
+ * dotted-quad, ready to hand to utun_open/ifconfig. */
+typedef struct {
+    char ip[16];       /* leased host address (yiaddr) */
+    char netmask[16];  /* option 1, or a /24 default */
+    char router[16];   /* option 3 (often the drone at .2); empty if absent */
+    char server[16];   /* option 54, the DHCP server (the drone) */
+} dhcp_lease;
+
+/* Run a DHCP DISCOVER/REQUEST exchange over the RNDIS link using host_mac as the
+ * client hardware address. Frames go out/in via usb_send_frame/usb_recv_frame.
+ * Returns 0 and fills *out on success; -1 on timeout (caller falls back to a
+ * static address). Doubles as a probe: success proves the drone's RNDIS IP
+ * stack is alive. */
+int dhcp_acquire(usb_ctx *usb, const uint8_t host_mac[ETHER_ADDR_LEN], dhcp_lease *out);
+
 /* utun IP packet -> Ethernet frame for the USB side. Writes into out (cap must
  * be >= ETHER_FRAME_MAX). Returns frame length, or 0 to drop. */
 int bridge_ip_to_eth(bridge_ctx *b, const uint8_t *ip, size_t iplen,

@@ -57,6 +57,7 @@ Developed and tested against a **DJI Mavic Pro** (USB `2ca3:001f`) on macOS 26.
 | RNDIS control handshake (INIT / SET filter / QUERY MAC / KEEPALIVE) | Verified |
 | utun create + IP config + packet delivery | Verified |
 | Host -> drone path (utun -> RNDIS bulk) | Verified |
+| DHCP client over RNDIS (frame construction) | Verified structurally; awaits a drone that answers |
 | Drone -> host path (inbound) | **Implemented but not yet exercised** |
 
 **Honest caveat:** the inbound half has not been confirmed end-to-end, because
@@ -104,6 +105,18 @@ Verbose per-packet/statistics logging:
 sudo DJI_DEBUG=1 ./dji-usbnet
 ```
 
+### Addressing (DHCP vs static)
+
+By default the bridge first tries **DHCP** over the RNDIS link: DJI aircraft that
+use the IP path run a DHCP server at `192.168.42.2` and expect the host to lease
+its address. If the drone answers, its lease is used (and that also proves the
+drone's RNDIS IP stack is alive). If there is no response within a few seconds,
+the bridge falls back to a static `192.168.42.1`. To skip DHCP entirely:
+
+```sh
+sudo ./dji-usbnet --static
+```
+
 ## Install (optional, run at boot)
 
 ```sh
@@ -139,6 +152,7 @@ only if your product needs the IP path; while loaded it holds RNDIS interfaces
 | `src/usb.c` | libusb RNDIS host: handshake + bulk RNDIS_PACKET_MSG framing |
 | `src/utun.c` | macOS userspace tunnel interface (create, configure, read/write) |
 | `src/bridge.c` | Ethernet/ARP <-> IP shim, drone-MAC learning |
+| `src/dhcp.c` | minimal DHCP client (DISCOVER/REQUEST) over the RNDIS link |
 | `src/rndis.h` | host-side RNDIS message and OID definitions |
 | `src/main.c` | wait-for-device + reconnect loop and the packet pump |
 | `src/probe.c` | standalone USB descriptor dumper (`make probe`) |

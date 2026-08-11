@@ -8,7 +8,7 @@ CFLAGS  ?= -O2 -g -Wall -Wextra -Wno-unused-parameter -std=c11
 CFLAGS  += $(LIBUSB_CFLAGS)
 LDFLAGS += $(LIBUSB_LIBS)
 
-SRC := src/main.c src/usb.c src/utun.c src/bridge.c
+SRC := src/main.c src/usb.c src/utun.c src/bridge.c src/dhcp.c
 OBJ := $(SRC:.c=.o)
 BIN := dji-usbnet
 PROBE := dji-probe

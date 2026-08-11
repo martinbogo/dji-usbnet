@@ -29,6 +29,8 @@
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
 
+static int g_static = 0;   /* --static: skip DHCP, use the static host address */
+
 /*
  * Move packets between the utun interface and the drone until the device
  * disappears (usb hard error) or a stop signal arrives. Returns 0 on a clean
@@ -105,10 +107,14 @@ static int run_session(usb_ctx *usb, utun_ctx *tun, bridge_ctx *bridge) {
 
 int main(int argc, char **argv) {
     uint16_t vid = DJI_USB_VID, pid = DJI_USB_PID;
-    /* Override the IDs for other DJI models: sudo ./dji-usbnet 0xVID 0xPID */
-    if (argc >= 3) {
-        vid = (uint16_t)strtol(argv[1], NULL, 0);
-        pid = (uint16_t)strtol(argv[2], NULL, 0);
+    /* Args: [--static] [VID PID]
+     *   --static        skip DHCP, use the static host address
+     *   VID PID          override USB IDs for other DJI models (hex ok) */
+    int a = 1;
+    if (a < argc && strcmp(argv[a], "--static") == 0) { g_static = 1; a++; }
+    if (a + 1 < argc) {
+        vid = (uint16_t)strtol(argv[a], NULL, 0);
+        pid = (uint16_t)strtol(argv[a + 1], NULL, 0);
     }
 
     signal(SIGINT, on_signal);
@@ -128,8 +134,25 @@ int main(int argc, char **argv) {
             continue;
         }
 
+        /* Try DHCP from the drone first; fall back to a static host address.
+         * (--static skips DHCP entirely.) */
+        const char *host_ip = HOST_IP, *netmask = NET_MASK;
+        dhcp_lease lease;
+        if (!g_static) {
+            uint8_t host_mac[ETHER_ADDR_LEN];
+            bridge_host_mac(host_mac);
+            if (dhcp_acquire(usb, host_mac, &lease) == 0) {
+                host_ip = lease.ip;
+                netmask = lease.netmask;
+                fprintf(stderr, "dji-usbnet: using DHCP lease %s/%s\n", host_ip, netmask);
+            } else {
+                fprintf(stderr, "dji-usbnet: no DHCP response; using static %s "
+                        "(drone RNDIS IP stack may be inactive)\n", HOST_IP);
+            }
+        }
+
         char ifname[16];
-        utun_ctx *tun = utun_open(HOST_IP, DRONE_IP, NET_MASK, ifname);
+        utun_ctx *tun = utun_open(host_ip, DRONE_IP, netmask, ifname);
         if (!tun) {
             fprintf(stderr, "fatal: could not create utun (are you root?)\n");
             usb_close(usb);
@@ -137,8 +160,9 @@ int main(int argc, char **argv) {
         }
 
         bridge_ctx bridge;
-        bridge_init(&bridge, drone_mac, HOST_IP, DRONE_IP);
-        fprintf(stderr, "dji-usbnet up: drone reachable at %s via %s\n", DRONE_IP, ifname);
+        bridge_init(&bridge, drone_mac, host_ip, DRONE_IP);
+        fprintf(stderr, "dji-usbnet up: drone reachable at %s via %s (host %s)\n",
+                DRONE_IP, ifname, host_ip);
 
         int rc = run_session(usb, tun, &bridge);
 
