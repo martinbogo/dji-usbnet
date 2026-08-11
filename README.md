@@ -67,6 +67,14 @@ traffic is written and correct by construction but wants testing on a
 Phantom-class aircraft that actually uses the link. **If you try it on such a
 product, please open an issue with the result** (see Contributing).
 
+**Confirmed for the Mavic Pro (wm220):** a DHCP DISCOVER sent over its RNDIS link
+gets no reply, and it never answers ping or sends any inbound frame. Its RNDIS
+interface is present in the USB descriptor but the firmware runs no IP stack on
+it - all DJI Assistant traffic uses the serial (`/dev/cu.usbmodem`) path, which
+macOS supports natively. So on a Mavic Pro this tool is not needed and has
+nothing to carry; it is included as a working, documented base for the
+Phantom-class products that do use the link.
+
 ## Requirements
 
 - macOS 11 or later (Apple Silicon or Intel)
