@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchDaemon for dji-usbnet.
+
+  Runs as root (required to create the utun interface), starts at boot, and is
+  kept alive. The daemon itself waits for the aircraft and reconnects on
+  unplug, so KeepAlive simply restarts it if it ever exits.
+
+  Install to /Library/LaunchDaemons/ (see packaging/install.sh). This is
+  OPTIONAL: only install it if your DJI product actually uses the RNDIS/IP path
+  (older Phantom-class models). While loaded, dji-usbnet holds RNDIS interfaces
+  0 and 1 on the device; DJI Assistant uses other interfaces, but if you suspect
+  USB contention, unload this daemon.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.martinbogomolni.dji-usbnet</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/dji-usbnet</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/var/log/dji-usbnet.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/dji-usbnet.log</string>
+</dict>
+</plist>

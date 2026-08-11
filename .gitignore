@@ -1,0 +1,8 @@
+# Build artifacts
+src/*.o
+/dji-usbnet
+/dji-probe
+
+# Debug/scratch
+*.log
+*.dSYM/
