@@ -378,6 +378,10 @@ int usb_send_frame(usb_ctx *u, const uint8_t *frame, size_t len) {
      * the frame and keep running rather than tearing the session down. Return 0
      * to signal "dropped"; a real send always transfers >0 bytes. */
     if (r == LIBUSB_ERROR_TIMEOUT) return 0;
+    if (r == LIBUSB_ERROR_PIPE) {   /* endpoint STALL: clear it, drop this frame */
+        libusb_clear_halt(u->dev, u->ep_out);
+        return 0;
+    }
     if (r != 0) {
         fprintf(stderr, "[usb] bulk OUT error: %s\n", libusb_strerror(r));
         return -1;  /* genuine error (e.g. device gone) - caller reconnects */
@@ -407,6 +411,10 @@ int usb_recv_frame(usb_ctx *u, uint8_t *frame, size_t cap) {
             int r = libusb_bulk_transfer(u->dev, u->ep_in, u->rx_buf, sizeof(u->rx_buf),
                                          &transferred, BULK_TIMEOUT_MS);
             if (r == LIBUSB_ERROR_TIMEOUT) return 0;
+            if (r == LIBUSB_ERROR_PIPE) {   /* endpoint STALL: clear and retry next call */
+                libusb_clear_halt(u->dev, u->ep_in);
+                return 0;
+            }
             if (r != 0) {
                 fprintf(stderr, "[usb] bulk IN error: %s\n", libusb_strerror(r));
                 return -1;
@@ -450,9 +458,20 @@ int usb_keepalive(usb_ctx *u) {
     return 0;
 }
 
+/* Tell the device to halt RNDIS so it resets its state for the next session.
+ * HALT has no completion; it is a best-effort courtesy on teardown. */
+static void rndis_halt(usb_ctx *u) {
+    rndis_hdr m;
+    m.msg_type = RNDIS_MSG_HALT;
+    m.msg_len = sizeof(m);
+    m.request_id = ++u->request_id;
+    (void)ctrl_send(u, &m, sizeof(m));
+}
+
 void usb_close(usb_ctx *u) {
     if (!u) return;
     if (u->dev) {
+        rndis_halt(u);
         libusb_release_interface(u->dev, u->iface_data);
         libusb_release_interface(u->dev, u->iface_comm);
         libusb_close(u->dev);
