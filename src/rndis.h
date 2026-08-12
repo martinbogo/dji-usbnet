@@ -41,12 +41,16 @@
 #define OID_802_3_CURRENT_ADDRESS     0x01010102u
 #define OID_GEN_MAXIMUM_FRAME_SIZE    0x00010106u
 
-/* Packet-filter bits for OID_GEN_CURRENT_PACKET_FILTER. */
-#define RNDIS_PACKET_TYPE_DIRECTED    0x00000001u
-#define RNDIS_PACKET_TYPE_MULTICAST   0x00000002u
-#define RNDIS_PACKET_TYPE_ALL_MULTI   0x00000004u
-#define RNDIS_PACKET_TYPE_BROADCAST   0x00000010u
-#define RNDIS_PACKET_TYPE_PROMISCUOUS 0x00000020u
+/* Packet-filter bits for OID_GEN_CURRENT_PACKET_FILTER (standard NDIS values).
+ * NOTE: BROADCAST is 0x08, not 0x10 (0x10 is SOURCE_ROUTING). Getting this
+ * wrong drops the BROADCAST bit, so the device never forwards broadcast frames
+ * (DHCP offers, ARP requests) up to the host. */
+#define RNDIS_PACKET_TYPE_DIRECTED       0x00000001u
+#define RNDIS_PACKET_TYPE_MULTICAST      0x00000002u
+#define RNDIS_PACKET_TYPE_ALL_MULTICAST  0x00000004u
+#define RNDIS_PACKET_TYPE_BROADCAST      0x00000008u
+#define RNDIS_PACKET_TYPE_SOURCE_ROUTING 0x00000010u
+#define RNDIS_PACKET_TYPE_PROMISCUOUS    0x00000020u
 
 /* USB class-specific control requests carrying the RNDIS command channel. */
 #define USB_CDC_SEND_ENCAPSULATED_COMMAND 0x00
@@ -130,21 +134,25 @@ typedef struct {
 } rndis_keepalive_msg;
 
 /*
- * Data-path wrapper. One RNDIS_PACKET_MSG carries exactly one Ethernet frame
- * in this minimal implementation (no per-transfer batching). data_offset is
- * measured from &data_offset.
+ * Data-path wrapper (REMOTE_NDIS_PACKET_MSG). One message carries exactly one
+ * Ethernet frame here (no per-transfer batching). data_offset is measured from
+ * &data_offset. This MUST be the full 44-byte / 11-field standard header - the
+ * Linux/Android RNDIS gadget most DJI aircraft derive from expects it, and with
+ * this layout data_offset auto-computes to 36. Dropping the vc_handle field
+ * (40-byte header, data_offset 32) makes strict gadgets reject the frame.
  */
 typedef struct {
     uint32_t msg_type;      /* RNDIS_MSG_PACKET */
     uint32_t msg_len;       /* header + payload */
-    uint32_t data_offset;   /* to the Ethernet frame, from &data_offset */
+    uint32_t data_offset;   /* to the Ethernet frame, from &data_offset (=> 36) */
     uint32_t data_len;      /* length of the Ethernet frame */
     uint32_t oob_data_offset;
     uint32_t oob_data_len;
     uint32_t num_oob;
     uint32_t per_packet_offset;
     uint32_t per_packet_len;
-    uint32_t reserved;
+    uint32_t vc_handle;     /* DeviceVcHandle; zero */
+    uint32_t reserved;      /* zero */
 } rndis_packet_msg;
 
 #pragma pack(pop)

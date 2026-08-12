@@ -33,8 +33,18 @@ struct usb_ctx {
     uint8_t  ep_in;        /* bulk IN  (device -> host) */
     uint8_t  ep_out;       /* bulk OUT (host -> device) */
     uint32_t request_id;
+    uint32_t dev_max_transfer;  /* device's MaxTransferSize from INIT_CMPLT */
     uint8_t  drone_mac[ETHER_ADDR_LEN];
 };
+
+/*
+ * Max size of a single bulk transfer we advertise to the device in INIT (the
+ * most it may send us in one transfer) and the size of our receive buffer.
+ * Sized to hold exactly one RNDIS_PACKET_MSG-wrapped Ethernet frame (44-byte
+ * header + 1514) with margin, which also keeps the device from batching several
+ * frames into one transfer - matching our one-frame-per-message parser.
+ */
+#define HOST_MAX_TRANSFER 2048
 
 /* Class-specific SEND_ENCAPSULATED_COMMAND / GET_ENCAPSULATED_RESPONSE over
  * the control endpoint, addressed to the comm interface. */
@@ -87,7 +97,7 @@ static int rndis_init(usb_ctx *u) {
     m.request_id = ++u->request_id;
     m.major_version = RNDIS_MAJOR_VERSION;
     m.minor_version = RNDIS_MINOR_VERSION;
-    m.max_transfer_size = 16384;
+    m.max_transfer_size = HOST_MAX_TRANSFER;   /* the most the device may send us */
 
     uint8_t resp[CTRL_BUF_MAX];
     int n = rndis_transact(u, &m, sizeof(m), resp, sizeof(resp));
@@ -101,6 +111,9 @@ static int rndis_init(usb_ctx *u) {
                 c->msg_type, c->status);
         return -1;
     }
+    /* Honor the device's negotiated MaxTransferSize: never send it a single
+     * transfer larger than this. */
+    u->dev_max_transfer = c->max_transfer_size ? c->max_transfer_size : HOST_MAX_TRANSFER;
     fprintf(stderr, "[usb] RNDIS init ok (dev max_xfer=%u)\n", c->max_transfer_size);
     return 0;
 }
@@ -129,6 +142,7 @@ static int rndis_set_filter(usb_ctx *u, uint32_t filter) {
         fprintf(stderr, "[usb] SET filter failed: 0x%x\n", c->status);
         return -1;
     }
+    fprintf(stderr, "[usb] RNDIS packet filter set to 0x%08x\n", filter);
     return 0;
 }
 
@@ -259,8 +273,18 @@ usb_ctx *usb_open(uint16_t vid, uint16_t pid, uint8_t out_drone_mac[ETHER_ADDR_L
         goto fail;
     }
 
+    /* Clear any stale STALL/HALT on the bulk pipes before the first transfer -
+     * the device's controller may have left an endpoint halted from a prior
+     * session, which would make every bulk transfer time out. Best-effort. */
+    (void)libusb_clear_halt(u->dev, u->ep_in);
+    (void)libusb_clear_halt(u->dev, u->ep_out);
+
     if (rndis_init(u) != 0) goto fail;
-    if (rndis_set_filter(u, RNDIS_PACKET_TYPE_DIRECTED | RNDIS_PACKET_TYPE_BROADCAST) != 0)
+    /* DIRECTED | MULTICAST | BROADCAST = 0x0B: normal-operation filter that lets
+     * the device forward unicast, multicast, and broadcast (DHCP/ARP) frames. */
+    if (rndis_set_filter(u, RNDIS_PACKET_TYPE_DIRECTED |
+                            RNDIS_PACKET_TYPE_MULTICAST |
+                            RNDIS_PACKET_TYPE_BROADCAST) != 0)
         goto fail;
     if (rndis_query_mac(u, u->drone_mac) != 0) {
         fprintf(stderr, "[usb] MAC query failed; using zero MAC\n");
@@ -280,6 +304,12 @@ fail:
 int usb_send_frame(usb_ctx *u, const uint8_t *frame, size_t len) {
     uint8_t buf[RNDIS_PACKET_MSG_HDR_LEN + ETHER_FRAME_MAX];
     if (len > ETHER_FRAME_MAX) return -1;
+    /* Never exceed the transfer size the device negotiated in INIT_CMPLT. */
+    if (u->dev_max_transfer && RNDIS_PACKET_MSG_HDR_LEN + len > u->dev_max_transfer) {
+        fprintf(stderr, "[usb] frame too large for device max_transfer (%u); dropping\n",
+                u->dev_max_transfer);
+        return 0;
+    }
     rndis_packet_msg *p = (rndis_packet_msg *)buf;
     memset(p, 0, sizeof(*p));
     p->msg_type = RNDIS_MSG_PACKET;
@@ -305,7 +335,9 @@ int usb_send_frame(usb_ctx *u, const uint8_t *frame, size_t len) {
 }
 
 int usb_recv_frame(usb_ctx *u, uint8_t *frame, size_t cap) {
-    uint8_t buf[RNDIS_PACKET_MSG_HDR_LEN + ETHER_FRAME_MAX + 64];
+    /* Buffer must be at least the MaxTransferSize we advertised to the device,
+     * or a larger-than-expected transfer returns LIBUSB_ERROR_OVERFLOW. */
+    uint8_t buf[HOST_MAX_TRANSFER];
     int transferred = 0;
     int r = libusb_bulk_transfer(u->dev, u->ep_in, buf, sizeof(buf),
                                  &transferred, BULK_TIMEOUT_MS);
