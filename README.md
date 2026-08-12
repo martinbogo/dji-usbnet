@@ -152,6 +152,12 @@ only if your product needs the IP path; while loaded it holds RNDIS interfaces
   appears) during a flash. Let the flash finish before starting the bridge.
 - **Assistant hiccups while the bridge runs** - stop the bridge; it and
   Assistant share the USB device (different interfaces, but worth ruling out).
+- **`bulk OUT error: Operation timed out` / "drone is not accepting RNDIS data"**
+  - the aircraft runs no IP stack on its RNDIS interface, so data sent to it is
+  never drained. This is expected on products that do not use the IP path (e.g.
+  the Mavic Pro); the bridge drops the frames and stays idle rather than
+  reconnecting. It is not a fault to fix - that aircraft simply does not need
+  this tool.
 
 ## How it works (internals)
 

@@ -292,9 +292,14 @@ int usb_send_frame(usb_ctx *u, const uint8_t *frame, size_t len) {
     int r = libusb_bulk_transfer(u->dev, u->ep_out, buf,
                                  (int)(RNDIS_PACKET_MSG_HDR_LEN + len),
                                  &transferred, BULK_TIMEOUT_MS);
+    /* A timeout means the device is not draining its OUT endpoint (e.g. an
+     * aircraft that runs no IP stack on RNDIS). That is not a disconnect: drop
+     * the frame and keep running rather than tearing the session down. Return 0
+     * to signal "dropped"; a real send always transfers >0 bytes. */
+    if (r == LIBUSB_ERROR_TIMEOUT) return 0;
     if (r != 0) {
         fprintf(stderr, "[usb] bulk OUT error: %s\n", libusb_strerror(r));
-        return -1;
+        return -1;  /* genuine error (e.g. device gone) - caller reconnects */
     }
     return transferred;
 }

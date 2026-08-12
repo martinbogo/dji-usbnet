@@ -42,6 +42,7 @@ static int run_session(usb_ctx *usb, utun_ctx *tun, bridge_ctx *bridge) {
     time_t last_stat = last_ka;
     int debug = (getenv("DJI_DEBUG") != NULL);
     unsigned long n_tun_in = 0, n_usb_out = 0, n_usb_in = 0, n_arp = 0, n_ip_up = 0;
+    int send_drops = 0, warned_idle = 0;   /* track a persistently un-drained OUT endpoint */
     uint8_t ip[ETHER_MTU + 64];
     uint8_t eth[ETHER_FRAME_MAX + 64];
     uint8_t scratch[ETHER_FRAME_MAX + 64];
@@ -62,8 +63,18 @@ static int run_session(usb_ctx *usb, utun_ctx *tun, bridge_ctx *bridge) {
                 n_tun_in++;
                 int ethlen = bridge_ip_to_eth(bridge, ip, iplen, eth, sizeof(eth));
                 if (ethlen > 0) {
-                    if (usb_send_frame(usb, eth, ethlen) < 0) return -1;
-                    n_usb_out++;
+                    int sent = usb_send_frame(usb, eth, ethlen);
+                    if (sent < 0) return -1;          /* device gone -> reconnect */
+                    if (sent > 0) { n_usb_out++; send_drops = 0; }
+                    else if (++send_drops == 12 && !warned_idle) {
+                        /* The drone keeps timing out on data it is sent: it is
+                         * not running an IP stack on RNDIS. Say so once, plainly,
+                         * instead of silently dropping every frame. */
+                        fprintf(stderr, "dji-usbnet: drone is not accepting RNDIS data "
+                                "(OUT endpoint not drained) - this aircraft does not use "
+                                "the IP path; the bridge will stay idle\n");
+                        warned_idle = 1;
+                    }
                 }
                 if (debug)
                     fprintf(stderr, "[dbg] utun->usb ip=%dB eth=%dB dst=%s\n",
