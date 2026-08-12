@@ -25,6 +25,17 @@
 #define BULK_TIMEOUT_MS 1000
 #define CTRL_BUF_MAX    1025
 
+/*
+ * Max size of a single bulk transfer we advertise to the device in INIT (the
+ * most it may send us in one transfer), and the size of our receive buffer. The
+ * device may bundle several RNDIS_PACKET_MSGs into one transfer up to this size;
+ * usb_recv_frame() iterates over them.
+ */
+#define HOST_MAX_TRANSFER 2048
+
+/* RNDIS notification on the interrupt IN pipe: NotificationType + Reserved. */
+#define RNDIS_NOTIF_RESPONSE_AVAILABLE 0x00000001u
+
 struct usb_ctx {
     libusb_context       *ctx;
     libusb_device_handle *dev;
@@ -37,19 +48,12 @@ struct usb_ctx {
     uint32_t request_id;
     uint32_t dev_max_transfer;  /* device's MaxTransferSize from INIT_CMPLT */
     uint8_t  drone_mac[ETHER_ADDR_LEN];
+    /* Receive reassembly: one bulk IN transfer may carry several bundled
+     * packets; parse them out across successive usb_recv_frame() calls. */
+    uint8_t  rx_buf[HOST_MAX_TRANSFER];
+    int      rx_len;       /* valid bytes in rx_buf */
+    int      rx_off;       /* parse cursor */
 };
-
-/* RNDIS notification on the interrupt IN pipe: NotificationType + Reserved. */
-#define RNDIS_NOTIF_RESPONSE_AVAILABLE 0x00000001u
-
-/*
- * Max size of a single bulk transfer we advertise to the device in INIT (the
- * most it may send us in one transfer) and the size of our receive buffer.
- * Sized to hold exactly one RNDIS_PACKET_MSG-wrapped Ethernet frame (44-byte
- * header + 1514) with margin, which also keeps the device from batching several
- * frames into one transfer - matching our one-frame-per-message parser.
- */
-#define HOST_MAX_TRANSFER 2048
 
 /* Class-specific SEND_ENCAPSULATED_COMMAND / GET_ENCAPSULATED_RESPONSE over
  * the control endpoint, addressed to the comm interface. */
@@ -341,10 +345,18 @@ fail:
 }
 
 int usb_send_frame(usb_ctx *u, const uint8_t *frame, size_t len) {
-    uint8_t buf[RNDIS_PACKET_MSG_HDR_LEN + ETHER_FRAME_MAX];
+    uint8_t buf[RNDIS_PACKET_MSG_HDR_LEN + ETHER_FRAME_MAX + 4];  /* +4 for pad */
     if (len > ETHER_FRAME_MAX) return -1;
+
+    /* RNDIS requires 32-bit alignment: MessageLength is the whole message
+     * rounded up to a 4-byte multiple, with the tail zero-padded. DataOffset
+     * (36) is already 4-byte aligned; DataLength stays the true frame length. */
+    uint32_t hdr = RNDIS_PACKET_MSG_HDR_LEN;
+    uint32_t raw = hdr + (uint32_t)len;
+    uint32_t total = (raw + 3u) & ~3u;
+
     /* Never exceed the transfer size the device negotiated in INIT_CMPLT. */
-    if (u->dev_max_transfer && RNDIS_PACKET_MSG_HDR_LEN + len > u->dev_max_transfer) {
+    if (u->dev_max_transfer && total > u->dev_max_transfer) {
         fprintf(stderr, "[usb] frame too large for device max_transfer (%u); dropping\n",
                 u->dev_max_transfer);
         return 0;
@@ -352,14 +364,14 @@ int usb_send_frame(usb_ctx *u, const uint8_t *frame, size_t len) {
     rndis_packet_msg *p = (rndis_packet_msg *)buf;
     memset(p, 0, sizeof(*p));
     p->msg_type = RNDIS_MSG_PACKET;
-    p->msg_len = (uint32_t)(RNDIS_PACKET_MSG_HDR_LEN + len);
-    p->data_offset = RNDIS_PACKET_MSG_HDR_LEN - offsetof(rndis_packet_msg, data_offset);
+    p->msg_len = total;
+    p->data_offset = hdr - offsetof(rndis_packet_msg, data_offset);  /* = 36 */
     p->data_len = (uint32_t)len;
-    memcpy(buf + RNDIS_PACKET_MSG_HDR_LEN, frame, len);
+    memcpy(buf + hdr, frame, len);
+    if (total > raw) memset(buf + raw, 0, total - raw);  /* zero the pad bytes */
 
     int transferred = 0;
-    int total = (int)(RNDIS_PACKET_MSG_HDR_LEN + len);
-    int r = libusb_bulk_transfer(u->dev, u->ep_out, buf, total,
+    int r = libusb_bulk_transfer(u->dev, u->ep_out, buf, (int)total,
                                  &transferred, BULK_TIMEOUT_MS);
     /* A timeout means the device is not draining its OUT endpoint (e.g. an
      * aircraft that runs no IP stack on RNDIS). That is not a disconnect: drop
@@ -382,26 +394,49 @@ int usb_send_frame(usb_ctx *u, const uint8_t *frame, size_t len) {
 }
 
 int usb_recv_frame(usb_ctx *u, uint8_t *frame, size_t cap) {
-    /* Buffer must be at least the MaxTransferSize we advertised to the device,
-     * or a larger-than-expected transfer returns LIBUSB_ERROR_OVERFLOW. */
-    uint8_t buf[HOST_MAX_TRANSFER];
-    int transferred = 0;
-    int r = libusb_bulk_transfer(u->dev, u->ep_in, buf, sizeof(buf),
-                                 &transferred, BULK_TIMEOUT_MS);
-    if (r == LIBUSB_ERROR_TIMEOUT) return 0;
-    if (r != 0) {
-        fprintf(stderr, "[usb] bulk IN error: %s\n", libusb_strerror(r));
-        return -1;
+    /*
+     * The device may bundle several REMOTE_NDIS_PACKET_MSGs into one bulk IN
+     * transfer. We keep the last transfer in u->rx_buf and hand back one frame
+     * per call, only issuing a new bulk read once the current bundle is drained.
+     * So "1 USB transfer == 1 network frame" is NOT assumed - we walk MsgLength.
+     */
+    for (;;) {
+        /* Need a fresh transfer? */
+        if (u->rx_off >= u->rx_len) {
+            int transferred = 0;
+            int r = libusb_bulk_transfer(u->dev, u->ep_in, u->rx_buf, sizeof(u->rx_buf),
+                                         &transferred, BULK_TIMEOUT_MS);
+            if (r == LIBUSB_ERROR_TIMEOUT) return 0;
+            if (r != 0) {
+                fprintf(stderr, "[usb] bulk IN error: %s\n", libusb_strerror(r));
+                return -1;
+            }
+            u->rx_len = transferred;
+            u->rx_off = 0;
+            if (transferred < (int)RNDIS_PACKET_MSG_HDR_LEN) { u->rx_len = 0; return 0; }
+        }
+
+        /* Parse the next packet in the bundle. */
+        rndis_packet_msg *p = (rndis_packet_msg *)(u->rx_buf + u->rx_off);
+        uint32_t msg_len = p->msg_len;
+        /* Stop on a malformed or non-data record; discard the rest of the bundle. */
+        if (p->msg_type != RNDIS_MSG_PACKET ||
+            msg_len < RNDIS_PACKET_MSG_HDR_LEN ||
+            (int)(u->rx_off + msg_len) > u->rx_len) {
+            u->rx_off = u->rx_len;
+            return 0;
+        }
+        uint32_t data_pos = offsetof(rndis_packet_msg, data_offset) + p->data_offset;
+        uint32_t dlen = p->data_len;
+        int base = u->rx_off;
+        u->rx_off += (int)msg_len;   /* advance to the next bundled packet */
+
+        if (dlen == 0 || data_pos + dlen > msg_len) continue;  /* skip empty/bad, try next */
+        size_t n = dlen;
+        if (n > cap) n = cap;
+        memcpy(frame, u->rx_buf + base + data_pos, n);
+        return (int)n;
     }
-    if (transferred < (int)RNDIS_PACKET_MSG_HDR_LEN) return 0;
-    rndis_packet_msg *p = (rndis_packet_msg *)buf;
-    if (p->msg_type != RNDIS_MSG_PACKET) return 0;  /* ignore non-data on bulk */
-    uint32_t off = offsetof(rndis_packet_msg, data_offset) + p->data_offset;
-    if (off + p->data_len > (uint32_t)transferred) return 0;
-    size_t len = p->data_len;
-    if (len > cap) len = cap;
-    memcpy(frame, buf + off, len);
-    return (int)len;
 }
 
 int usb_keepalive(usb_ctx *u) {
