@@ -39,6 +39,43 @@ static const char *udp_service(uint16_t port) {
     }
 }
 
+/* One's-complement 16-bit checksum over big-endian words. */
+static uint16_t inet_csum(const uint8_t *p, int len) {
+    uint32_t sum = 0;
+    while (len > 1) { sum += (uint16_t)((p[0] << 8) | p[1]); p += 2; len -= 2; }
+    if (len) sum += (uint16_t)(p[0] << 8);
+    while (sum >> 16) sum = (sum & 0xffff) + (sum >> 16);
+    return (uint16_t)~sum;
+}
+
+/*
+ * If `ip` is an ICMP echo request, build the matching echo reply into `out`
+ * (same length) and return 1; otherwise return 0. Some apps ping the aircraft
+ * as a reachability check before connecting; the drone does not answer ICMP
+ * itself, so the bridge answers on its behalf (the link IS up for real traffic).
+ * IPv4 only.
+ */
+static int icmp_echo_reply(const uint8_t *ip, int len, uint8_t *out,
+                           uint32_t drone_ip_be) {
+    if (len < 28 || (ip[0] >> 4) != 4 || ip[9] != 1) return 0;   /* IPv4 + ICMP */
+    if (memcmp(ip + 16, &drone_ip_be, 4) != 0) return 0;         /* only for the drone */
+    int ihl = (ip[0] & 0x0f) * 4;
+    if (len < ihl + 8) return 0;
+    if (ip[ihl] != 8) return 0;                                  /* echo request */
+    memcpy(out, ip, len);
+    memcpy(out + 12, ip + 16, 4);          /* src = old dst (the drone) */
+    memcpy(out + 16, ip + 12, 4);          /* dst = old src (the host)  */
+    out[10] = out[11] = 0;
+    uint16_t hc = inet_csum(out, ihl);
+    out[10] = (uint8_t)(hc >> 8); out[11] = (uint8_t)(hc & 0xff);
+    uint8_t *ic = out + ihl;
+    ic[0] = 0;                             /* type 0 = echo reply */
+    ic[2] = ic[3] = 0;
+    uint16_t cc = inet_csum(ic, len - ihl);
+    ic[2] = (uint8_t)(cc >> 8); ic[3] = (uint8_t)(cc & 0xff);
+    return 1;
+}
+
 /* Decode an Ethernet frame to one human-readable line (debug only). */
 static void dump_frame(const char *dir, const uint8_t *eth, int len) {
     if (len < 14) { fprintf(stderr, "[frm] %s runt %dB\n", dir, len); return; }
@@ -103,7 +140,11 @@ static int run_session(usb_ctx *usb, utun_ctx *tun, bridge_ctx *bridge) {
         /* App -> drone: IP from utun, wrap to Ethernet, send over RNDIS. */
         if (s > 0 && FD_ISSET(tfd, &rfds)) {
             int iplen = utun_read_ip(tun, ip, sizeof(ip));
-            if (iplen > 0) {
+            if (iplen > 0 && icmp_echo_reply(ip, iplen, scratch, bridge->drone_ip_be)) {
+                /* Answer the reachability ping locally instead of forwarding. */
+                utun_write_ip(tun, scratch, iplen);
+                if (debug) fprintf(stderr, "[icmp] echo reply issued for the drone\n");
+            } else if (iplen > 0) {
                 n_tun_in++;
                 int ethlen = bridge_ip_to_eth(bridge, ip, iplen, eth, sizeof(eth));
                 if (ethlen > 0) {
