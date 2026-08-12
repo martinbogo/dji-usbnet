@@ -1,87 +1,68 @@
 # dji-usbnet
 
-A **userspace** replacement for the HoRNDIS kernel extension, for using
-**DJI Assistant 2** on modern macOS (Apple Silicon, macOS 11+) **without a kext,
-without disabling SIP, and without an Apple kernel-extension entitlement.**
+A userspace RNDIS host for using **DJI Assistant 2** on modern macOS (Apple
+Silicon, macOS 11+) without a kernel extension, without disabling SIP, and
+without an Apple kernel-extension entitlement. It is a drop-in replacement for
+the HoRNDIS kext.
 
-Some DJI aircraft present themselves to the host as a **USB RNDIS Ethernet
-device**, and DJI Assistant talks to them over IP at `192.168.42.2`. On old
-macOS you installed the HoRNDIS kext to turn that USB device into a network
-interface. On Apple Silicon that path is painful: the kext must be signed with a
-special Apple entitlement, and loading a third-party kext at all requires
-lowering the machine's security (Reduced Security + third-party kexts, and in
-practice SIP off).
+## Overview
 
-`dji-usbnet` does the same job from userspace instead:
+DJI aircraft in the RNDIS family present themselves to the host as a USB RNDIS
+Ethernet device, and DJI Assistant reaches the aircraft over IP at
+`192.168.42.2`. Historically that required the HoRNDIS kernel extension to turn
+the USB device into a network interface. On Apple Silicon that approach is
+impractical: a kext must be signed with a special Apple entitlement, and loading
+any third-party kext requires lowering the machine's security (Reduced Security
+plus third-party kext approval, and in practice SIP disabled).
 
-- **libusb** claims the aircraft and speaks the RNDIS host protocol (no kext).
+`dji-usbnet` performs the same function entirely in userspace:
+
+- **libusb** claims the aircraft and implements the RNDIS host protocol.
 - **utun** (`SYSPROTO_CONTROL` / `com.apple.net.utun_control`) publishes a
-  routable IP interface (no kext, root only, no entitlement).
-- A small **layer-2/3 bridge** terminates Ethernet + ARP on the USB side so the
-  utun side only ever sees IP.
+  routable IP interface. Root is required to create it, but no kext and no
+  entitlement.
+- A layer-2/3 bridge terminates Ethernet and ARP on the USB side so the utun
+  side only ever sees IP.
 
-DJI Assistant is completely unmodified: it connects to `192.168.42.2` exactly as
-before.
+DJI Assistant is unmodified; it connects to `192.168.42.2` as before.
 
 ```
 App --connect(192.168.42.2)--> utun --IP--> [bridge +Eth/+ARP] --> RNDIS/USB --> drone
 drone --> RNDIS/USB --> [bridge -Eth, answer ARP] --IP--> utun --> App
 ```
 
-## Do you even need this?
+## Compatibility
 
-DJI aircraft in the RNDIS family (Mavic Pro, Phantom-class, and others) expose a
-USB RNDIS interface and reach `192.168.42.2` over IP. They also talk to the
-flight controller over a serial (`/dev/cu.usbmodem`) channel that macOS supports
-natively - so basic detection and some operations work without any RNDIS driver,
-which can make it look like the IP path is unused. It is used for the parts that
-run over IP; without a driver presenting `192.168.42.2`, those hang.
+Developed and verified against a **DJI Mavic Pro** (USB `2ca3:001f`) on macOS 26.
+Other RNDIS-family aircraft (Phantom 3/4, Inspire, and similar) are expected to
+work; reports and USB IDs for additional models are welcome.
 
-Quick check: with the aircraft connected and DJI Assistant open, run
+To check whether a given aircraft uses the IP path, connect it, open DJI
+Assistant, and run:
 
 ```sh
 lsof -nP -iTCP@192.168.42.2
 ```
 
-If that shows a connection, your product uses the IP path and this tool is
-relevant. If it is empty but Assistant still sees the drone, you do not need
-this tool.
+Note that DJI Assistant also communicates with the flight controller over a
+serial (`/dev/cu.usbmodem`) channel that macOS supports natively, so an aircraft
+can be detected and partially operated without an RNDIS driver. Operations that
+run over IP require this bridge (or HoRNDIS).
 
-## Status / what is verified
+## Verification
 
-Developed and tested against a **DJI Mavic Pro** (USB `2ca3:001f`) on macOS 26.
+With a Mavic Pro in normal operating mode:
 
-| Piece | State |
-|-------|-------|
-| Build (clang + libusb) | Working |
-| USB descriptor / endpoint auto-detection | Verified (RNDIS control iface 0, data iface 1) |
-| RNDIS control handshake (INIT / SET filter / QUERY MAC / KEEPALIVE) | Verified |
-| utun create + IP config + packet delivery | Verified |
-| Host -> drone path (utun -> RNDIS bulk) | Verified - 100% delivery, no drops |
-| DHCP client over RNDIS | **Verified end-to-end**: the drone's DHCP server leased 192.168.42.3 |
-| Drone -> host path (inbound) | **Verified**: received DHCP + broadcast traffic from the drone |
+| Capability | Result |
+|------------|--------|
+| USB descriptor / endpoint auto-detection | RNDIS control iface 0, data iface 1, interrupt IN, bulk IN/OUT |
+| RNDIS control handshake (INIT / SET filter / QUERY MAC / KEEPALIVE) | Completes |
+| DHCP over RNDIS | Lease obtained from the aircraft's DHCP server (`192.168.42.2` → host `192.168.42.3`) |
+| Host → drone (bulk OUT) | 100% delivery, no drops, verified under load |
+| Drone → host (bulk IN) | Inbound frames received and forwarded to utun |
 
-**Verified against a DJI Mavic Pro (wm220):** with the aircraft in normal
-operating mode, the bridge completes a full DHCP exchange over RNDIS - the
-drone's DHCP server at 192.168.42.2 leases the host 192.168.42.3 - bulk OUT
-delivers every frame with zero drops (confirmed under an nmap flood), and the
-drone sends inbound traffic (its DHCP server broadcasts) that the bridge forwards
-up the utun. So the Mavic Pro **does** run an IP stack on RNDIS and this bridge
-talks to it.
-
-Two caveats worth knowing for this aircraft specifically:
-- The drone **firewalls unsolicited TCP** (a port scan returns nothing) and does
-  not advertise services (no mDNS/SSDP), so DJI Assistant reaches it on a
-  specific hard-coded port rather than anything discoverable.
-- DJI Assistant also talks to the flight controller over the **serial**
-  (`/dev/cu.usbmodem`) path, independent of RNDIS; a stuck FC there is not
-  something this bridge affects.
-
-Earlier revisions of this README claimed the Mavic Pro did not use RNDIS. That
-was wrong - it was an artifact of driver bugs (see git history: packet filter,
-44-byte packet header, ZLP, alignment, interrupt-pipe handshake) and of testing
-while the aircraft was in firmware-upgrade mode. Fixing those and testing in
-normal mode showed the link works.
+The aircraft firewalls unsolicited TCP and does not advertise services (no
+mDNS/SSDP); DJI Assistant connects to it on a fixed port.
 
 ## Requirements
 
@@ -95,111 +76,113 @@ normal mode showed the link works.
 make
 ```
 
-Produces `./dji-usbnet` (the bridge) and, via `make probe`, `./dji-probe`
-(a descriptor dumper for identifying a new device).
+This produces `./dji-usbnet` (the bridge). `make probe` additionally builds
+`./dji-probe`, a USB descriptor dumper for identifying a device.
 
-## Run
+## Usage
 
 ```sh
 sudo ./dji-usbnet
 ```
 
 Root is required only to create and configure the utun interface. The process
-waits for the aircraft, brings the link up, and keeps serving across
-unplug/replug until you Ctrl-C it. Then launch DJI Assistant as usual.
+waits for the aircraft, brings the link up, and continues to serve across
+unplug/replug until interrupted. Launch DJI Assistant as usual once it is
+running.
 
-For a different DJI model, pass its USB IDs (find them with `./dji-probe` or
+For a different DJI model, pass its USB IDs (from `./dji-probe` or
 `system_profiler SPUSBDataType`):
 
 ```sh
 sudo ./dji-usbnet 0xVID 0xPID
 ```
 
-Verbose per-packet/statistics logging:
+Verbose per-frame and statistics logging:
 
 ```sh
 sudo DJI_DEBUG=1 ./dji-usbnet
 ```
 
-### Addressing (DHCP vs static)
+### Addressing
 
-By default the bridge first tries **DHCP** over the RNDIS link: DJI aircraft that
-use the IP path run a DHCP server at `192.168.42.2` and expect the host to lease
-its address. If the drone answers, its lease is used (and that also proves the
-drone's RNDIS IP stack is alive). If there is no response within a few seconds,
-the bridge falls back to a static `192.168.42.1`. To skip DHCP entirely:
+By default the bridge requests an address by DHCP over the RNDIS link; DJI
+aircraft that use the IP path run a DHCP server at `192.168.42.2`. If there is no
+response within a few seconds, the bridge falls back to a static
+`192.168.42.1`. To skip DHCP:
 
 ```sh
 sudo ./dji-usbnet --static
 ```
 
-## Install (optional, run at boot)
+## Install (optional)
 
 ```sh
-./packaging/install.sh            # build + install /usr/local/bin/dji-usbnet
-./packaging/install.sh --daemon   # also install & load the LaunchDaemon
-./packaging/uninstall.sh          # remove everything
+./packaging/install.sh            # build and install /usr/local/bin/dji-usbnet
+./packaging/install.sh --daemon   # also install and load the LaunchDaemon
+./packaging/uninstall.sh          # remove
 ```
 
-The LaunchDaemon runs as root, starts at boot, and restarts on exit. Install it
-only if your product needs the IP path; while loaded it holds RNDIS interfaces
-0/1 on the device.
+The LaunchDaemon runs as root, starts at boot, and restarts on exit. While
+loaded it holds the RNDIS interfaces (0 and 1) on the device.
 
 ## Troubleshooting
 
-- **No traffic reaches the drone / `tun_in` stays 0** - check for an active
-  **VPN first**. VPNs with a kill switch or "route all traffic" (NordVPN /
-  NordLynx, WireGuard, Tailscale exit nodes, enterprise clients) install a
-  global route that swallows every utun-bound packet before the routing table
-  sees it. Disconnect the VPN and retry. This was the single biggest gotcha
-  during development.
-- **`could not create utun (are you root?)`** - run with `sudo`.
-- **`device ... not found`** - the aircraft is off, asleep, or in a different
-  USB mode; power-cycle it and confirm with `./dji-probe`.
-- **Firmware flashing** - the aircraft re-enumerates (an extra vendor interface
-  appears) during a flash. Let the flash finish before starting the bridge.
-- **Assistant hiccups while the bridge runs** - stop the bridge; it and
-  Assistant share the USB device (different interfaces, but worth ruling out).
-- **`bulk OUT error: Operation timed out` / "drone is not accepting RNDIS data"**
-  - the aircraft runs no IP stack on its RNDIS interface, so data sent to it is
-  never drained. This is expected on products that do not use the IP path (e.g.
-  the Mavic Pro); the bridge drops the frames and stays idle rather than
-  reconnecting. It is not a fault to fix - that aircraft simply does not need
-  this tool.
+- **No traffic reaches the drone (`tun_in` stays 0):** check for an active VPN.
+  VPNs with a kill switch or full-tunnel routing (NordVPN/NordLynx, WireGuard,
+  Tailscale exit nodes, enterprise clients) install a global route that captures
+  utun-bound packets before the routing table is consulted. Disconnect the VPN
+  and retry.
+- **`could not create utun (are you root?)`:** run with `sudo`.
+- **`device ... not found`:** the aircraft is off, asleep, or in a different USB
+  mode. Power-cycle it and confirm with `./dji-probe`.
+- **During a firmware update** the aircraft re-enumerates with an additional
+  vendor interface and its RNDIS IP stack may be inactive. Run the bridge with
+  the aircraft in normal operating mode.
+- **`bulk OUT error` / "drone is not accepting RNDIS data":** the aircraft is not
+  draining its OUT endpoint, typically because its RNDIS IP stack is not active
+  (for example while in firmware-update mode). The bridge drops outbound frames
+  and continues rather than reconnecting.
+- **DJI Assistant misbehaves while the bridge runs:** stop the bridge to rule out
+  USB contention. It and Assistant share the device on different interfaces.
 
-## How it works (internals)
+## Architecture
 
 | File | Role |
 |------|------|
-| `src/usb.c` | libusb RNDIS host: handshake + bulk RNDIS_PACKET_MSG framing |
+| `src/usb.c` | libusb RNDIS host: control handshake and bulk `REMOTE_NDIS_PACKET_MSG` framing |
 | `src/utun.c` | macOS userspace tunnel interface (create, configure, read/write) |
-| `src/bridge.c` | Ethernet/ARP <-> IP shim, drone-MAC learning |
-| `src/dhcp.c` | minimal DHCP client (DISCOVER/REQUEST) over the RNDIS link |
-| `src/rndis.h` | host-side RNDIS message and OID definitions |
-| `src/main.c` | wait-for-device + reconnect loop and the packet pump |
+| `src/bridge.c` | Ethernet/ARP ↔ IP shim and drone-MAC learning |
+| `src/dhcp.c` | DHCP client (DISCOVER/REQUEST) over the RNDIS link |
+| `src/rndis.h` | RNDIS message and OID definitions |
+| `src/main.c` | wait-for-device and reconnect loop, packet pump, frame decoding |
 | `src/probe.c` | standalone USB descriptor dumper (`make probe`) |
 
-Notes for hackers:
+Implementation notes:
 
-- RNDIS `InformationBufferOffset` fields are measured from the **RequestId**
-  field (8 bytes into the message). Getting the SET-filter offset wrong silently
-  programs a packet filter of 0 ("receive nothing").
-- utun is strictly point-to-point / layer 3; it rejects a plain `/24`. The
-  bridge answers the drone's ARP for the host IP with a synthetic locally
-  administered MAC, and learns the drone's MAC from its first inbound frame.
+- RNDIS `InformationBufferOffset` fields are measured from the RequestId field
+  (8 bytes into the message).
+- The `REMOTE_NDIS_PACKET_MSG` header is 44 bytes (`DataOffset` = 36); messages
+  are padded to a 4-byte boundary, and a zero-length packet follows any bulk OUT
+  whose length is an exact multiple of the endpoint's max packet size.
+- Control transactions wait for `RESPONSE_AVAILABLE` on the interrupt IN pipe
+  before issuing `GET_ENCAPSULATED_RESPONSE`, falling back to polling.
+- The receive path parses bundled `REMOTE_NDIS_PACKET_MSG` records, so one bulk
+  IN transfer may yield multiple Ethernet frames.
+- utun is point-to-point layer 3. The bridge answers the drone's ARP for the
+  host address with a synthetic locally administered MAC and learns the drone's
+  MAC from inbound frames.
 - The packet pump is single-threaded (select on utun, short-timeout bulk poll on
-  USB). Fine for control-plane traffic; a latency-sensitive build would move the
-  USB IN read to its own thread or use libusb async transfers.
+  USB). A latency-sensitive build would move the bulk IN read to its own thread
+  or use libusb asynchronous transfers.
 
 ## Contributing
 
-The most useful contribution right now is **a test report from a DJI product
-that uses the RNDIS/IP path** (Phantom 3/4, Inspire, etc.): does DJI Assistant
-connect through `dji-usbnet`? Please include the output of `./dji-probe` and,
-if it works, `DJI_DEBUG=1` stats. New VID/PIDs and per-model notes are welcome.
+Test reports from other RNDIS-family DJI aircraft are especially useful: whether
+DJI Assistant connects through `dji-usbnet`, along with `./dji-probe` output and,
+where applicable, `DJI_DEBUG=1` logs. New USB IDs and per-model notes are welcome.
 
 ## License
 
-MIT - see [LICENSE](LICENSE). This is an independent userspace reimplementation;
-it does not incorporate HoRNDIS source (which is GPL). "HoRNDIS" and "DJI" are
-referenced only for interoperability.
+MIT; see [LICENSE](LICENSE). This is an independent userspace implementation and
+does not incorporate HoRNDIS source. "HoRNDIS" and "DJI" are referenced only for
+interoperability.
