@@ -32,10 +32,15 @@ struct usb_ctx {
     int      iface_data;   /* CDC data interface (bulk endpoints) */
     uint8_t  ep_in;        /* bulk IN  (device -> host) */
     uint8_t  ep_out;       /* bulk OUT (host -> device) */
+    uint8_t  ep_intr;      /* interrupt IN on the comm iface (RESPONSE_AVAILABLE) */
+    uint16_t ep_out_mps;   /* bulk OUT wMaxPacketSize (for ZLP handling) */
     uint32_t request_id;
     uint32_t dev_max_transfer;  /* device's MaxTransferSize from INIT_CMPLT */
     uint8_t  drone_mac[ETHER_ADDR_LEN];
 };
+
+/* RNDIS notification on the interrupt IN pipe: NotificationType + Reserved. */
+#define RNDIS_NOTIF_RESPONSE_AVAILABLE 0x00000001u
 
 /*
  * Max size of a single bulk transfer we advertise to the device in INIT (the
@@ -81,6 +86,22 @@ static int ctrl_recv(usb_ctx *u, void *buf, int cap) {
 static int rndis_transact(usb_ctx *u, const void *cmd, int cmdlen,
                           uint8_t *resp, int respcap) {
     if (ctrl_send(u, cmd, cmdlen) < 0) return -1;
+
+    /* Proper RNDIS control flow: after SEND_ENCAPSULATED_COMMAND the device
+     * raises RESPONSE_AVAILABLE on the interrupt IN pipe, and only then is
+     * GET_ENCAPSULATED_RESPONSE valid. Servicing that notification matters -
+     * some device control interfaces hang if it is left unread. Wait for it,
+     * then fetch. If the pipe is silent/unavailable, fall back to polling so we
+     * still work on lenient devices. */
+    if (u->ep_intr) {
+        uint8_t notif[8];
+        int nt = 0;
+        (void)libusb_interrupt_transfer(u->dev, u->ep_intr, notif, sizeof(notif),
+                                        &nt, CTRL_TIMEOUT_MS);
+        /* notif[0..3] == RNDIS_NOTIF_RESPONSE_AVAILABLE when it arrives; we read
+         * the response regardless, having now drained the interrupt pipe. */
+    }
+
     for (int tries = 0; tries < 25; tries++) {
         int n = ctrl_recv(u, resp, respcap);
         if (n >= (int)sizeof(rndis_hdr)) return n;
@@ -170,17 +191,28 @@ static int rndis_query_mac(usb_ctx *u, uint8_t mac[ETHER_ADDR_LEN]) {
     return 0;
 }
 
-/* Pull the two bulk endpoints out of an interface descriptor. */
+/* Pull the two bulk endpoints (and the OUT max packet size) from an interface. */
 static int iface_bulk_eps(const struct libusb_interface_descriptor *id,
-                          uint8_t *in, uint8_t *out) {
-    *in = *out = 0;
+                          uint8_t *in, uint8_t *out, uint16_t *out_mps) {
+    *in = *out = 0; *out_mps = 0;
     for (int e = 0; e < id->bNumEndpoints; e++) {
         const struct libusb_endpoint_descriptor *ep = &id->endpoint[e];
         if ((ep->bmAttributes & 0x03) != LIBUSB_TRANSFER_TYPE_BULK) continue;
         if (ep->bEndpointAddress & LIBUSB_ENDPOINT_IN) *in = ep->bEndpointAddress;
-        else *out = ep->bEndpointAddress;
+        else { *out = ep->bEndpointAddress; *out_mps = ep->wMaxPacketSize; }
     }
     return (*in && *out) ? 0 : -1;
+}
+
+/* Find the interrupt IN endpoint of an interface (the RNDIS notify pipe). */
+static uint8_t iface_intr_in(const struct libusb_interface_descriptor *id) {
+    for (int e = 0; e < id->bNumEndpoints; e++) {
+        const struct libusb_endpoint_descriptor *ep = &id->endpoint[e];
+        if ((ep->bmAttributes & 0x03) == LIBUSB_TRANSFER_TYPE_INTERRUPT &&
+            (ep->bEndpointAddress & LIBUSB_ENDPOINT_IN))
+            return ep->bEndpointAddress;
+    }
+    return 0;
 }
 
 /*
@@ -204,14 +236,17 @@ static int detect_endpoints(usb_ctx *u, libusb_device *dev) {
     if (libusb_get_active_config_descriptor(dev, &cfg) != 0) return -1;
 
     int comm_num = -1;
+    uint8_t intr = 0;
     /* 1) RNDIS control interface: wireless-controller class with the
-     *    RNDIS-over-Ethernet subclass/protocol (0xE0 / 0x01 / 0x03). */
+     *    RNDIS-over-Ethernet subclass/protocol (0xE0 / 0x01 / 0x03). Also grab
+     *    its interrupt IN endpoint (the RESPONSE_AVAILABLE notify pipe). */
     for (int i = 0; i < cfg->bNumInterfaces && comm_num < 0; i++) {
         const struct libusb_interface_descriptor *id = &cfg->interface[i].altsetting[0];
         if (id->bInterfaceClass == 0xE0 &&
             id->bInterfaceSubClass == 0x01 &&
             id->bInterfaceProtocol == 0x03) {
             comm_num = id->bInterfaceNumber;
+            intr = iface_intr_in(id);
         }
     }
     if (comm_num < 0) {
@@ -224,11 +259,12 @@ static int detect_endpoints(usb_ctx *u, libusb_device *dev) {
      *    is greater than the control interface's, with two bulk endpoints. */
     int data_num = -1;
     uint8_t in = 0, out = 0;
+    uint16_t out_mps = 0;
     for (int i = 0; i < cfg->bNumInterfaces; i++) {
         const struct libusb_interface_descriptor *id = &cfg->interface[i].altsetting[0];
         if (id->bInterfaceClass == 0x0A &&
             id->bInterfaceNumber > comm_num &&
-            iface_bulk_eps(id, &in, &out) == 0) {
+            iface_bulk_eps(id, &in, &out, &out_mps) == 0) {
             data_num = id->bInterfaceNumber;
             break;   /* take the FIRST following data iface, not the last */
         }
@@ -243,8 +279,11 @@ static int detect_endpoints(usb_ctx *u, libusb_device *dev) {
     u->iface_data = data_num;
     u->ep_in = in;
     u->ep_out = out;
-    fprintf(stderr, "[usb] RNDIS comm iface=%d data iface=%d ep_in=0x%02x ep_out=0x%02x\n",
-            u->iface_comm, u->iface_data, u->ep_in, u->ep_out);
+    u->ep_intr = intr;
+    u->ep_out_mps = out_mps ? out_mps : 512;
+    fprintf(stderr, "[usb] RNDIS comm iface=%d data iface=%d ep_in=0x%02x ep_out=0x%02x "
+            "intr=0x%02x out_mps=%u\n",
+            u->iface_comm, u->iface_data, u->ep_in, u->ep_out, u->ep_intr, u->ep_out_mps);
     return 0;
 }
 
@@ -319,8 +358,8 @@ int usb_send_frame(usb_ctx *u, const uint8_t *frame, size_t len) {
     memcpy(buf + RNDIS_PACKET_MSG_HDR_LEN, frame, len);
 
     int transferred = 0;
-    int r = libusb_bulk_transfer(u->dev, u->ep_out, buf,
-                                 (int)(RNDIS_PACKET_MSG_HDR_LEN + len),
+    int total = (int)(RNDIS_PACKET_MSG_HDR_LEN + len);
+    int r = libusb_bulk_transfer(u->dev, u->ep_out, buf, total,
                                  &transferred, BULK_TIMEOUT_MS);
     /* A timeout means the device is not draining its OUT endpoint (e.g. an
      * aircraft that runs no IP stack on RNDIS). That is not a disconnect: drop
@@ -330,6 +369,14 @@ int usb_send_frame(usb_ctx *u, const uint8_t *frame, size_t len) {
     if (r != 0) {
         fprintf(stderr, "[usb] bulk OUT error: %s\n", libusb_strerror(r));
         return -1;  /* genuine error (e.g. device gone) - caller reconnects */
+    }
+    /* If the transfer length is an exact multiple of the bulk endpoint's max
+     * packet size, USB requires a zero-length packet to mark the end of the
+     * transfer - otherwise the device keeps waiting for more and the message is
+     * never delivered. */
+    if (u->ep_out_mps && total > 0 && (total % u->ep_out_mps) == 0) {
+        int zt = 0;
+        (void)libusb_bulk_transfer(u->dev, u->ep_out, buf, 0, &zt, BULK_TIMEOUT_MS);
     }
     return transferred;
 }
