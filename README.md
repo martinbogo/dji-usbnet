@@ -30,11 +30,12 @@ drone --> RNDIS/USB --> [bridge -Eth, answer ARP] --IP--> utun --> App
 
 ## Do you even need this?
 
-**Maybe not.** Not every DJI product uses the RNDIS/IP path. Newer aircraft (for
-example the **Mavic Pro**) talk to DJI Assistant entirely over **raw USB** and
-never touch `192.168.42.2` - for those, Assistant works with no kext and no
-`dji-usbnet` at all. DJI's installer bundles HoRNDIS because *some* products
-(older **Phantom**-class models) need the IP link.
+DJI aircraft in the RNDIS family (Mavic Pro, Phantom-class, and others) expose a
+USB RNDIS interface and reach `192.168.42.2` over IP. They also talk to the
+flight controller over a serial (`/dev/cu.usbmodem`) channel that macOS supports
+natively - so basic detection and some operations work without any RNDIS driver,
+which can make it look like the IP path is unused. It is used for the parts that
+run over IP; without a driver presenting `192.168.42.2`, those hang.
 
 Quick check: with the aircraft connected and DJI Assistant open, run
 
@@ -56,24 +57,31 @@ Developed and tested against a **DJI Mavic Pro** (USB `2ca3:001f`) on macOS 26.
 | USB descriptor / endpoint auto-detection | Verified (RNDIS control iface 0, data iface 1) |
 | RNDIS control handshake (INIT / SET filter / QUERY MAC / KEEPALIVE) | Verified |
 | utun create + IP config + packet delivery | Verified |
-| Host -> drone path (utun -> RNDIS bulk) | Verified |
-| DHCP client over RNDIS (frame construction) | Verified structurally; awaits a drone that answers |
-| Drone -> host path (inbound) | **Implemented but not yet exercised** |
+| Host -> drone path (utun -> RNDIS bulk) | Verified - 100% delivery, no drops |
+| DHCP client over RNDIS | **Verified end-to-end**: the drone's DHCP server leased 192.168.42.3 |
+| Drone -> host path (inbound) | **Verified**: received DHCP + broadcast traffic from the drone |
 
-**Honest caveat:** the inbound half has not been confirmed end-to-end, because
-the only device on hand (Mavic Pro) does not use the RNDIS/IP path, so it never
-sends IP frames back. The host side is proven; the code that handles drone->host
-traffic is written and correct by construction but wants testing on a
-Phantom-class aircraft that actually uses the link. **If you try it on such a
-product, please open an issue with the result** (see Contributing).
+**Verified against a DJI Mavic Pro (wm220):** with the aircraft in normal
+operating mode, the bridge completes a full DHCP exchange over RNDIS - the
+drone's DHCP server at 192.168.42.2 leases the host 192.168.42.3 - bulk OUT
+delivers every frame with zero drops (confirmed under an nmap flood), and the
+drone sends inbound traffic (its DHCP server broadcasts) that the bridge forwards
+up the utun. So the Mavic Pro **does** run an IP stack on RNDIS and this bridge
+talks to it.
 
-**Confirmed for the Mavic Pro (wm220):** a DHCP DISCOVER sent over its RNDIS link
-gets no reply, and it never answers ping or sends any inbound frame. Its RNDIS
-interface is present in the USB descriptor but the firmware runs no IP stack on
-it - all DJI Assistant traffic uses the serial (`/dev/cu.usbmodem`) path, which
-macOS supports natively. So on a Mavic Pro this tool is not needed and has
-nothing to carry; it is included as a working, documented base for the
-Phantom-class products that do use the link.
+Two caveats worth knowing for this aircraft specifically:
+- The drone **firewalls unsolicited TCP** (a port scan returns nothing) and does
+  not advertise services (no mDNS/SSDP), so DJI Assistant reaches it on a
+  specific hard-coded port rather than anything discoverable.
+- DJI Assistant also talks to the flight controller over the **serial**
+  (`/dev/cu.usbmodem`) path, independent of RNDIS; a stuck FC there is not
+  something this bridge affects.
+
+Earlier revisions of this README claimed the Mavic Pro did not use RNDIS. That
+was wrong - it was an artifact of driver bugs (see git history: packet filter,
+44-byte packet header, ZLP, alignment, interrupt-pipe handshake) and of testing
+while the aircraft was in firmware-upgrade mode. Fixing those and testing in
+normal mode showed the link works.
 
 ## Requirements
 

@@ -25,6 +25,50 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/select.h>
+#include <arpa/inet.h>
+
+/* Recognize a few well-known UDP services so an inbound frame is self-labeling. */
+static const char *udp_service(uint16_t port) {
+    switch (port) {
+        case 67: case 68: return "DHCP";
+        case 53:   return "DNS";
+        case 5353: return "mDNS";
+        case 1900: return "SSDP";
+        case 137: case 138: return "NetBIOS";
+        default:   return "";
+    }
+}
+
+/* Decode an Ethernet frame to one human-readable line (debug only). */
+static void dump_frame(const char *dir, const uint8_t *eth, int len) {
+    if (len < 14) { fprintf(stderr, "[frm] %s runt %dB\n", dir, len); return; }
+    uint16_t etype = (uint16_t)((eth[12] << 8) | eth[13]);
+    if (etype == 0x0806) { fprintf(stderr, "[frm] %s ARP %dB\n", dir, len); return; }
+    if (etype != 0x0800) {
+        fprintf(stderr, "[frm] %s ethertype=0x%04x %dB\n", dir, etype, len);
+        return;
+    }
+    const uint8_t *ip = eth + 14;
+    int ihl = (ip[0] & 0x0f) * 4;
+    uint8_t proto = ip[9];
+    char s[16], d[16];
+    inet_ntop(AF_INET, ip + 12, s, sizeof s);
+    inet_ntop(AF_INET, ip + 16, d, sizeof d);
+    const uint8_t *l4 = ip + ihl;
+    if (proto == 17 && len >= 14 + ihl + 8) {
+        uint16_t sp = (uint16_t)((l4[0] << 8) | l4[1]);
+        uint16_t dp = (uint16_t)((l4[2] << 8) | l4[3]);
+        const char *svc = udp_service(dp); if (!*svc) svc = udp_service(sp);
+        fprintf(stderr, "[frm] %s UDP %s:%u -> %s:%u %s %dB\n", dir, s, sp, d, dp, svc, len);
+    } else if (proto == 6 && len >= 14 + ihl + 14) {
+        uint16_t sp = (uint16_t)((l4[0] << 8) | l4[1]);
+        uint16_t dp = (uint16_t)((l4[2] << 8) | l4[3]);
+        fprintf(stderr, "[frm] %s TCP %s:%u -> %s:%u flags=0x%02x %dB\n",
+                dir, s, sp, d, dp, l4[13], len);
+    } else {
+        fprintf(stderr, "[frm] %s IP proto=%u %s -> %s %dB\n", dir, proto, s, d, len);
+    }
+}
 
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
@@ -88,6 +132,7 @@ static int run_session(usb_ctx *usb, utun_ctx *tun, bridge_ctx *bridge) {
             if (ethlen == 0) break;      /* timeout / no data this round */
             if (ethlen < 0) return -1;   /* device error -> reconnect */
             n_usb_in++;
+            if (debug) dump_frame("in ", eth, ethlen);
             size_t reply_len = 0;
             int act = bridge_eth_from_drone(bridge, eth, ethlen,
                                             scratch, sizeof(scratch), &reply_len);
